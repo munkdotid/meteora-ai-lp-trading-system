@@ -1,0 +1,332 @@
+// This is your Prisma schema file
+// Learn more: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// CORE ENTITIES
+// ==========================================
+
+model Pool {
+  id          String   @id @default(uuid())
+  address     String   @unique
+  tokenA      String
+  tokenB      String
+  tokenASymbol String
+  tokenBSymbol String
+  
+  // Pool metrics
+  currentPrice Decimal  @db.Decimal(20, 10)
+  tvl          Decimal  @db.Decimal(20, 2)
+  volume24h    Decimal  @db.Decimal(20, 2)
+  feeRate      Decimal  @db.Decimal(8, 6)
+  volatility   Decimal  @db.Decimal(8, 6)
+  
+  // Timestamps
+  poolCreatedAt DateTime
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // Relations
+  positions     Position[]
+  snapshots     PoolSnapshot[]
+  aiDecisions   AIDecision[]
+  
+  @@index([address])
+  @@index([tvl])
+  @@index([volume24h])
+  @@index([updatedAt])
+}
+
+model Position {
+  id          String   @id @default(uuid())
+  
+  // Relations
+  pool        Pool     @relation(fields: [poolId], references: [id])
+  poolId      String
+  
+  // Strategy
+  strategy    String   // alpha, range, momentum
+  
+  // Entry details
+  entryPrice  Decimal  @db.Decimal(20, 10)
+  entryTime   DateTime
+  
+  // Investment
+  investmentSol  Decimal @db.Decimal(20, 10)
+  investmentUsd  Decimal @db.Decimal(20, 2)
+  
+  // Range
+  rangeLower  Decimal  @db.Decimal(20, 10)
+  rangeUpper  Decimal  @db.Decimal(20, 10)
+  
+  // Current state
+  currentPrice   Decimal?  @db.Decimal(20, 10)
+  currentValueUsd Decimal? @db.Decimal(20, 2)
+  
+  // Performance
+  realizedPnl    Decimal @db.Decimal(20, 2) @default(0)
+  unrealizedPnl  Decimal @db.Decimal(20, 2) @default(0)
+  pnlPercentage  Decimal @db.Decimal(8, 4) @default(0)
+  
+  // Fees
+  feesTokenA     Decimal @db.Decimal(20, 10) @default(0)
+  feesTokenB     Decimal @db.Decimal(20, 10) @default(0)
+  feesUsd        Decimal @db.Decimal(20, 2) @default(0)
+  
+  // Impermanent loss
+  impermanentLoss Decimal @db.Decimal(8, 4) @default(0)
+  
+  // Status
+  status      String   @default("active") // active, rebalancing, closing, closed
+  inRange     Boolean  @default(true)
+  
+  // AI metadata
+  aiConfidence Decimal @db.Decimal(5, 4)
+  riskScore    Int
+  expectedApr  Decimal @db.Decimal(8, 4)
+  
+  // Timestamps
+  lastRebalance DateTime?
+  exitTime      DateTime?
+  
+  // Transactions
+  entryTxSignature  String   @db.VarChar(88)
+  exitTxSignature   String?  @db.VarChar(88)
+  
+  // Metadata
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // Relations
+  trades        Trade[]
+  
+  @@index([poolId])
+  @@index([status])
+  @@index([entryTime])
+  @@index([exitTime])
+}
+
+model Trade {
+  id          String   @id @default(uuid())
+  
+  // Relations
+  position    Position @relation(fields: [positionId], references: [id])
+  positionId  String
+  
+  // Trade details
+  type        String   // entry, exit, rebalance
+  action      String   // swap, add_liquidity, remove_liquidity
+  
+  // Token amounts
+  tokenIn     String?
+  tokenOut    String?
+  amountIn    Decimal? @db.Decimal(20, 10)
+  amountOut   Decimal? @db.Decimal(20, 10)
+  
+  // Metrics
+  slippage    Decimal  @db.Decimal(8, 4)
+  gasCostSol  Decimal  @db.Decimal(20, 10)
+  
+  // Transaction
+  txSignature String   @db.VarChar(88)
+  success     Boolean
+  errorMessage String?
+  
+  // Metadata
+  timestamp   DateTime
+  createdAt   DateTime @default(now())
+  
+  @@index([positionId])
+  @@index([timestamp])
+  @@index([success])
+}
+
+// ==========================================
+// ANALYTICS & HISTORY
+// ==========================================
+
+model PoolSnapshot {
+  id          String   @id @default(uuid())
+  
+  // Relations
+  pool        Pool     @relation(fields: [poolId], references: [id])
+  poolId      String
+  
+  // Metrics at snapshot time
+  price       Decimal  @db.Decimal(20, 10)
+  tvl         Decimal  @db.Decimal(20, 2)
+  volume24h   Decimal  @db.Decimal(20, 2)
+  volatility  Decimal  @db.Decimal(8, 6)
+  
+  // Calculated scores
+  opportunityScore Decimal? @db.Decimal(5, 4)
+  feeApr      Decimal? @db.Decimal(8, 4)
+  
+  // Timestamp
+  timestamp   DateTime
+  
+  createdAt   DateTime @default(now())
+  
+  @@index([poolId])
+  @@index([timestamp])
+  @@index([poolId, timestamp])
+}
+
+model AIDecision {
+  id          String   @id @default(uuid())
+  
+  // Relations
+  pool        Pool     @relation(fields: [poolId], references: [id])
+  poolId      String
+  
+  // Decision
+  action      String   // enter, exit, rebalance, hold, skip
+  strategy    String?  // alpha, range, momentum
+  confidence  Decimal  @db.Decimal(5, 4)
+  expectedApr Decimal  @db.Decimal(8, 4)
+  riskScore   Int
+  reasoning   String   @db.Text
+  
+  // Recommended parameters
+  recommendedRangeLower Decimal? @db.Decimal(20, 10)
+  recommendedRangeUpper Decimal? @db.Decimal(20, 10)
+  positionSize Decimal? @db.Decimal(8, 4)
+  
+  // Execution
+  executed    Boolean  @default(false)
+  resultPnl   Decimal? @db.Decimal(20, 2)
+  resultSuccess Boolean?
+  
+  // Timestamp
+  timestamp   DateTime
+  createdAt   DateTime @default(now())
+  
+  @@index([poolId])
+  @@index([timestamp])
+  @@index([executed])
+  @@index([action, timestamp])
+}
+
+model Performance {
+  id          String   @id @default(uuid())
+  
+  // Date (unique per day)
+  date        DateTime @unique
+  
+  // Balance
+  startingBalance Decimal @db.Decimal(20, 2)
+  endingBalance   Decimal @db.Decimal(20, 2)
+  
+  // PnL
+  realizedPnl   Decimal @db.Decimal(20, 2)
+  unrealizedPnl Decimal @db.Decimal(20, 2)
+  
+  // Breakdown
+  feesEarned    Decimal @db.Decimal(20, 2)
+  impermanentLoss Decimal @db.Decimal(20, 2)
+  
+  // Trading stats
+  totalTrades   Int
+  winningTrades Int
+  losingTrades  Int
+  winRate       Decimal @db.Decimal(5, 4)
+  averageReturn Decimal @db.Decimal(8, 4)
+  
+  // Risk metrics
+  sharpeRatio   Decimal? @db.Decimal(8, 4)
+  maxDrawdown   Decimal? @db.Decimal(8, 4)
+  volatility    Decimal? @db.Decimal(8, 4)
+  
+  // AI stats
+  aiConfidenceAvg Decimal? @db.Decimal(5, 4)
+  
+  createdAt     DateTime @default(now())
+  
+  @@index([date])
+}
+
+// ==========================================
+// SYSTEM & AUDIT
+// ==========================================
+
+model SystemState {
+  id          String   @id @default(uuid())
+  
+  key         String   @unique
+  value       String
+  
+  updatedAt   DateTime @updatedAt
+  
+  @@index([key])
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  
+  userId      String?
+  action      String
+  details     Json?
+  ipAddress   String?
+  
+  timestamp   DateTime
+  createdAt   DateTime @default(now())
+  
+  @@index([userId])
+  @@index([action])
+  @@index([timestamp])
+}
+
+model TelegramSession {
+  id          String   @id @default(uuid())
+  
+  userId      String   @unique
+  username    String?
+  isAuthorized Boolean @default(false)
+  isAdmin     Boolean @default(false)
+  
+  // 2FA
+  twoFASecret String?
+  twoFAVerified Boolean @default(false)
+  
+  // Session
+  lastActivity DateTime
+  createdAt   DateTime @default(now())
+  
+  @@index([userId])
+  @@index([isAuthorized])
+}
+
+// ==========================================
+// NOTIFICATIONS
+// ==========================================
+
+model Notification {
+  id          String   @id @default(uuid())
+  
+  type        String   // profit, loss, rebalance, entry, exit, emergency, daily_report
+  title       String
+  message     String   @db.Text
+  
+  // Data
+  data        Json?
+  
+  // Delivery
+  sent        Boolean  @default(false)
+  sentAt      DateTime?
+  error       String?
+  
+  // Metadata
+  createdAt   DateTime @default(now())
+  
+  @@index([type])
+  @@index([sent])
+  @@index([createdAt])
+}
