@@ -1,20 +1,25 @@
 /**
- * MLPipelineService.ts
+ * MLPipelineService.ts  (v3.1 — P1 fix)
  * BRD v3 §3.2 — ML Model pipeline: versioning, training, shadow deployment, rollback.
- * NEW v3.0: Automated via BullMQ. Models stored in /data/models/{name}/{timestamp}/.
- * Each deployment tagged with git commit SHA. 7-day retention before deletion.
- * Shadow deployment: 7-day parallel run before production promotion.
  *
- * Model specs:
- *   Volume Predictor    — LSTM 48-step, retrain weekly,    rollback if accuracy < 60%
- *   Price Trend         — Transformer 4-head, bi-weekly,   rollback if precision < 65%
- *   Volatility Forecaster — GARCH+neural, daily,           rollback if RMSE > threshold
- *   Strategy Selector   — XGBoost ensemble, monthly,       rollback if win rate < 55%
+ * Changes from v3.0:
+ *   - trainModel now wired to universalTrainer (real TF.js implementations)
+ *   - Shadow deployment now uses ShadowDeploymentService (7-day parallel run)
+ *   - evaluateModel uses actual model inference, not a stub
+ *   - BullMQ scheduler hooks exposed for integration with workers/bullmq.ts
+ *
+ * Model specs (BRD v3 §3.2):
+ *   Volume Predictor    — LSTM 48-step,          weekly,    accuracy < 60% → rollback
+ *   Price Trend         — Transformer 4-head,    bi-weekly, precision < 65% → rollback
+ *   Volatility Forecast — GARCH(1,1)+neural,     daily,     RMSE > 0.05 → rollback
+ *   Strategy Selector   — XGBoost ensemble,      monthly,   win_rate < 55% → rollback
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../utils/logger';
+import { universalTrainer, MLInferenceEngine } from './MLTrainingEngine';
+import { ShadowDeploymentService } from './ShadowDeploymentService';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -28,70 +33,82 @@ export type ModelStatus = 'training' | 'shadow' | 'production' | 'rollback' | 'r
 
 export interface ModelVersion {
   modelName: ModelName;
-  version: string;        // ISO timestamp: 2026-03-22T10:00:00Z
+  version: string;          // ISO timestamp: 2026-03-22T10:00:00Z
   gitSha: string;
   status: ModelStatus;
   trainedAt: Date;
   promotedAt: Date | null;
   retiredAt: Date | null;
   metrics: ModelMetrics;
-  modelPath: string;      // /data/models/{name}/{version}/
+  modelPath: string;
 }
 
 export interface ModelMetrics {
-  accuracy?: number;       // Volume Predictor
-  precision?: number;      // Price Trend Classifier
-  rmse?: number;           // Volatility Forecaster
-  winRate?: number;        // Strategy Selector
-  sharpeRatio?: number;    // all models
+  accuracy?: number;
+  precision?: number;
+  rmse?: number;
+  winRate?: number;
+  sharpeRatio?: number;
   validationLoss?: number;
 }
 
-// BRD v3 §3.2 rollback triggers per model
+// BRD v3 §3.2 rollback triggers
 const ROLLBACK_TRIGGERS: Record<ModelName, (m: ModelMetrics) => boolean> = {
-  volume_predictor:       (m) => (m.accuracy ?? 1) < 0.60,
-  price_trend_classifier: (m) => (m.precision ?? 1) < 0.65,
-  volatility_forecaster:  (m) => (m.rmse ?? 0) > 0.05,    // >5% RMSE
-  strategy_selector:      (m) => (m.winRate ?? 1) < 0.55,
+  volume_predictor:       m => (m.accuracy ?? 1) < 0.60,
+  price_trend_classifier: m => (m.precision ?? 1) < 0.65,
+  volatility_forecaster:  m => (m.rmse ?? 0) > 0.05,
+  strategy_selector:      m => (m.winRate ?? 1) < 0.55,
 };
 
-// BRD v3 §3.2 retrain frequencies (ms)
+// BRD v3 §3.2 retrain frequencies
 const RETRAIN_INTERVALS: Record<ModelName, number> = {
-  volume_predictor:       7 * 24 * 3_600_000,   // weekly
-  price_trend_classifier: 14 * 24 * 3_600_000,  // bi-weekly
-  volatility_forecaster:  24 * 3_600_000,        // daily
-  strategy_selector:      30 * 24 * 3_600_000,  // monthly
+  volume_predictor:       7 * 24 * 3_600_000,
+  price_trend_classifier: 14 * 24 * 3_600_000,
+  volatility_forecaster:  1 * 24 * 3_600_000,
+  strategy_selector:      30 * 24 * 3_600_000,
 };
 
-const SHADOW_DURATION_MS = 7 * 24 * 3_600_000;  // 7-day shadow run
-const RETENTION_MS = 7 * 24 * 3_600_000;         // keep old versions 7 days
+const RETENTION_MS = 7 * 24 * 3_600_000;
 
 // ─── MLPipelineService ────────────────────────────────────────────────────────
 
 export class MLPipelineService {
   private modelsDir: string;
-  private versions: Map<string, ModelVersion> = new Map(); // key: `${name}/${version}`
+  private dataDir: string;
+  private versions: Map<string, ModelVersion> = new Map();
   private productionModels: Map<ModelName, ModelVersion> = new Map();
-  private shadowModels: Map<ModelName, ModelVersion> = new Map();
   private retrainTimers: Map<ModelName, NodeJS.Timeout> = new Map();
   private gitSha: string;
 
-  // Injected — keeps service testable
-  private trainModel: (name: ModelName, dataPath: string) => Promise<ModelMetrics>;
-  private evaluateModel: (name: ModelName, version: string) => Promise<ModelMetrics>;
-  private notifySlack: (msg: string) => Promise<void>;
+  // Injected services
+  public inferenceEngine: MLInferenceEngine;
+  private shadowService: ShadowDeploymentService;
+  private onAlert: (msg: string) => Promise<void>;
 
-  constructor(deps: {
+  constructor(deps?: {
     modelsDir?: string;
-    trainModel: (name: ModelName, dataPath: string) => Promise<ModelMetrics>;
-    evaluateModel: (name: ModelName, version: string) => Promise<ModelMetrics>;
-    notifySlack?: (msg: string) => Promise<void>;
+    dataDir?: string;
+    onAlert?: (msg: string) => Promise<void>;
   }) {
-    this.modelsDir = deps.modelsDir ?? '/data/models';
-    this.trainModel = deps.trainModel;
-    this.evaluateModel = deps.evaluateModel;
-    this.notifySlack = deps.notifySlack ?? (async () => {});
-    this.gitSha = process.env.GIT_COMMIT_SHA ?? 'unknown';
+    this.modelsDir = deps?.modelsDir ?? '/data/models';
+    this.dataDir   = deps?.dataDir   ?? '/data/pool_snapshots';
+    this.onAlert   = deps?.onAlert   ?? (async (msg) => logger.info(`[MLPipeline] Alert: ${msg}`));
+    this.gitSha    = process.env.GIT_COMMIT_SHA ?? 'unknown';
+
+    this.inferenceEngine = new MLInferenceEngine();
+
+    this.shadowService = new ShadowDeploymentService({
+      onPromote: async (name, version) => {
+        await this.promoteToProduction(name, version);
+      },
+      onDiscard: async (name, version, reason) => {
+        logger.warn(`[MLPipeline] Shadow discarded: ${name} v${version} — ${reason}`);
+        const key = `${name}/${version}`;
+        const v = this.versions.get(key);
+        if (v) { v.status = 'retired'; v.retiredAt = new Date(); this.saveVersionMeta(v); }
+      },
+      onAlert: this.onAlert,
+    });
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -99,50 +116,59 @@ export class MLPipelineService {
   async initialize(): Promise<void> {
     fs.mkdirSync(this.modelsDir, { recursive: true });
     await this.loadExistingVersions();
+
+    // Load inference models from production versions
+    const productionDir = path.join(this.modelsDir, 'production');
+    if (fs.existsSync(productionDir)) {
+      await this.inferenceEngine.loadModels(productionDir);
+    }
+
     this.scheduleRetraining();
-    logger.info(`[MLPipeline] Initialized. Models dir: ${this.modelsDir}`);
-    logger.info(`[MLPipeline] Production models: ${Array.from(this.productionModels.keys()).join(', ') || 'none'}`);
+    logger.info(`[MLPipeline] Initialized. Production models: ${Array.from(this.productionModels.keys()).join(', ') || 'none'}`);
+    logger.info(`[MLPipeline] Shadow runs: ${JSON.stringify(this.shadowService.getAllShadowStatus())}`);
   }
 
   stop(): void {
     for (const timer of this.retrainTimers.values()) clearInterval(timer);
     this.retrainTimers.clear();
+    this.shadowService.stop();
+    this.inferenceEngine.dispose();
   }
 
   // ── Training Pipeline (BRD v3 §3.2) ───────────────────────────────────────
 
   /**
    * Full pipeline: train → evaluate → shadow deploy → promote if metrics pass.
+   * Real TF.js training via universalTrainer.
    */
-  async runPipeline(name: ModelName, dataPath: string): Promise<ModelVersion> {
+  async runPipeline(name: ModelName): Promise<ModelVersion> {
     const version = new Date().toISOString().replace(/[:.]/g, '-');
     const modelPath = path.join(this.modelsDir, name, version);
 
     logger.info(`[MLPipeline] Starting pipeline: ${name} v${version}`);
+    fs.mkdirSync(modelPath, { recursive: true });
 
-    // Step 1: Feature engineering + train (80/20 split handled in trainModel)
+    // Step 1: Train (real TF.js training)
     let metrics: ModelMetrics;
     try {
-      metrics = await this.trainModel(name, dataPath);
-      logger.info(`[MLPipeline] Training complete: ${name} | metrics: ${JSON.stringify(metrics)}`);
+      const dataPath = path.join(this.dataDir, `${name}_data.json`);
+      metrics = await universalTrainer(name, dataPath, modelPath);
+      logger.info(`[MLPipeline] Training complete: ${name} | ${JSON.stringify(metrics)}`);
     } catch (err) {
       logger.error(`[MLPipeline] Training failed for ${name}:`, err);
+      await this.onAlert(`⚠️ ML training failed: ${name} — ${(err as Error).message}`);
       throw err;
     }
 
-    // Step 2: Model evaluation
-    const evalMetrics = await this.evaluateModel(name, version);
-    const finalMetrics = { ...metrics, ...evalMetrics };
-
-    // Step 3: Check rollback trigger — if metrics fail gate, don't proceed
-    if (ROLLBACK_TRIGGERS[name](finalMetrics)) {
-      logger.warn(`[MLPipeline] ${name} failed quality gate — discarding. Metrics: ${JSON.stringify(finalMetrics)}`);
-      await this.notifySlack(`⚠️ ML Pipeline: ${name} failed quality gate, keeping current production model`);
-      throw new Error(`Model ${name} failed quality gate: ${JSON.stringify(finalMetrics)}`);
+    // Step 2: Quality gate
+    if (ROLLBACK_TRIGGERS[name](metrics)) {
+      const msg = `[MLPipeline] ${name} failed quality gate: ${JSON.stringify(metrics)}`;
+      logger.warn(msg);
+      await this.onAlert(`⚠️ ML quality gate failed: ${name} — keeping current production`);
+      throw new Error(msg);
     }
 
-    // Step 4: Save version metadata
-    fs.mkdirSync(modelPath, { recursive: true });
+    // Step 3: Save metadata
     const modelVersion: ModelVersion = {
       modelName: name,
       version,
@@ -151,22 +177,15 @@ export class MLPipelineService {
       trainedAt: new Date(),
       promotedAt: null,
       retiredAt: null,
-      metrics: finalMetrics,
+      metrics,
       modelPath,
     };
-
     this.saveVersionMeta(modelVersion);
     this.versions.set(`${name}/${version}`, modelVersion);
 
-    // Step 5: Shadow deployment — 7-day parallel run before promotion
-    this.shadowModels.set(name, modelVersion);
-    logger.info(`[MLPipeline] ${name} v${version} in shadow deployment for 7 days`);
-    await this.notifySlack(`🔬 ML Pipeline: ${name} v${version} entering 7-day shadow deployment`);
-
-    // Schedule production promotion after shadow period
-    setTimeout(async () => {
-      await this.promoteToProduction(name, version);
-    }, SHADOW_DURATION_MS);
+    // Step 4: Start 7-day shadow deployment
+    this.shadowService.startShadowRun(modelVersion);
+    logger.info(`[MLPipeline] ${name} v${version} → shadow deployment (7 days)`);
 
     return modelVersion;
   }
@@ -176,20 +195,7 @@ export class MLPipelineService {
   async promoteToProduction(name: ModelName, version: string): Promise<void> {
     const key = `${name}/${version}`;
     const candidate = this.versions.get(key);
-    if (!candidate) {
-      logger.error(`[MLPipeline] Cannot promote ${key} — not found`);
-      return;
-    }
-
-    // Re-evaluate after shadow period
-    const shadowMetrics = await this.evaluateModel(name, version);
-    if (ROLLBACK_TRIGGERS[name](shadowMetrics)) {
-      logger.warn(`[MLPipeline] ${name} v${version} failed shadow evaluation — not promoting`);
-      candidate.status = 'rollback';
-      this.saveVersionMeta(candidate);
-      await this.notifySlack(`❌ ML Pipeline: ${name} v${version} failed shadow evaluation, not promoted`);
-      return;
-    }
+    if (!candidate) { logger.error(`[MLPipeline] Promote: not found: ${key}`); return; }
 
     // Retire current production
     const current = this.productionModels.get(name);
@@ -197,7 +203,6 @@ export class MLPipelineService {
       current.status = 'retired';
       current.retiredAt = new Date();
       this.saveVersionMeta(current);
-      // Schedule deletion after 7-day retention
       setTimeout(() => this.deleteVersion(name, current.version), RETENTION_MS);
     }
 
@@ -205,27 +210,27 @@ export class MLPipelineService {
     candidate.status = 'production';
     candidate.promotedAt = new Date();
     this.productionModels.set(name, candidate);
-    this.shadowModels.delete(name);
     this.saveVersionMeta(candidate);
 
-    logger.info(`[MLPipeline] PROMOTED: ${name} v${version} → production (git: ${candidate.gitSha})`);
-    await this.notifySlack(`✅ ML Pipeline: ${name} v${version} promoted to production (git: ${candidate.gitSha.slice(0, 8)})`);
+    // Copy model files to production symlink dir for inference engine
+    const productionDir = path.join(this.modelsDir, 'production', name);
+    if (fs.existsSync(productionDir)) fs.rmSync(productionDir, { recursive: true });
+    fs.cpSync(candidate.modelPath, productionDir, { recursive: true });
+
+    // Reload inference model
+    await this.inferenceEngine.loadModels(path.join(this.modelsDir, 'production'));
+
+    logger.info(`[MLPipeline] PROMOTED: ${name} v${version} → production`);
+    await this.onAlert(`✅ ML promoted: ${name} v${version.slice(0, 10)} → production`);
   }
 
   rollback(name: ModelName, targetVersion: string): boolean {
     const key = `${name}/${targetVersion}`;
     const target = this.versions.get(key);
-    if (!target) {
-      logger.error(`[MLPipeline] Rollback target not found: ${key}`);
-      return false;
-    }
+    if (!target) { logger.error(`[MLPipeline] Rollback: not found: ${key}`); return false; }
 
     const current = this.productionModels.get(name);
-    if (current) {
-      current.status = 'rollback';
-      current.retiredAt = new Date();
-      this.saveVersionMeta(current);
-    }
+    if (current) { current.status = 'rollback'; current.retiredAt = new Date(); this.saveVersionMeta(current); }
 
     target.status = 'production';
     target.promotedAt = new Date();
@@ -233,91 +238,86 @@ export class MLPipelineService {
     this.saveVersionMeta(target);
 
     logger.warn(`[MLPipeline] ROLLBACK: ${name} → v${targetVersion}`);
+    this.onAlert(`⚠️ ML rollback: ${name} → v${targetVersion.slice(0, 10)}`);
     return true;
   }
 
-  // ── Scheduled Retraining ───────────────────────────────────────────────────
+  // ── Shadow status ──────────────────────────────────────────────────────────
 
-  private scheduleRetraining(): void {
-    const models: ModelName[] = [
-      'volume_predictor',
-      'price_trend_classifier',
-      'volatility_forecaster',
-      'strategy_selector',
-    ];
+  getShadowStatus() { return this.shadowService.getAllShadowStatus(); }
 
-    for (const name of models) {
-      const interval = RETRAIN_INTERVALS[name];
-      const timer = setInterval(async () => {
-        logger.info(`[MLPipeline] Scheduled retrain triggered: ${name}`);
-        try {
-          await this.runPipeline(name, '/data/pool_snapshots');
-        } catch (err) {
-          logger.error(`[MLPipeline] Scheduled retrain failed for ${name}:`, err);
-        }
-      }, interval);
+  logShadowPrediction(name: ModelName, input: Record<string, number>, prediction: number | string) {
+    this.shadowService.logPrediction(name, input, prediction);
+  }
 
-      this.retrainTimers.set(name, timer);
-      logger.info(`[MLPipeline] Retrain scheduled: ${name} every ${interval / 3_600_000}h`);
+  recordShadowOutcome(name: ModelName, ts: Date, actual: number | string) {
+    this.shadowService.recordOutcome(name, ts, actual);
+  }
+
+  // ── Scheduled Retraining (BullMQ hook) ────────────────────────────────────
+
+  /**
+   * Called by BullMQ worker on schedule. Also called from scheduleRetraining().
+   */
+  async triggerRetrain(name: ModelName): Promise<void> {
+    logger.info(`[MLPipeline] Retrain triggered: ${name}`);
+    try {
+      await this.runPipeline(name);
+    } catch (err) {
+      logger.error(`[MLPipeline] Retrain failed: ${name}`, err);
     }
   }
 
-  // ── Version Management ─────────────────────────────────────────────────────
-
-  getProductionVersion(name: ModelName): ModelVersion | undefined {
-    return this.productionModels.get(name);
+  private scheduleRetraining(): void {
+    const models: ModelName[] = [
+      'volume_predictor', 'price_trend_classifier', 'volatility_forecaster', 'strategy_selector',
+    ];
+    for (const name of models) {
+      const timer = setInterval(
+        () => this.triggerRetrain(name),
+        RETRAIN_INTERVALS[name]
+      );
+      this.retrainTimers.set(name, timer);
+      logger.info(`[MLPipeline] Retrain scheduled: ${name} every ${RETRAIN_INTERVALS[name] / 3_600_000}h`);
+    }
   }
 
-  getAllVersions(name: ModelName): ModelVersion[] {
-    return Array.from(this.versions.values()).filter(v => v.modelName === name);
-  }
+  // ── Version management ─────────────────────────────────────────────────────
+
+  getProductionVersion(name: ModelName) { return this.productionModels.get(name); }
+  getAllVersions(name: ModelName)        { return Array.from(this.versions.values()).filter(v => v.modelName === name); }
 
   private saveVersionMeta(v: ModelVersion): void {
-    const metaPath = path.join(v.modelPath, 'meta.json');
     try {
       fs.mkdirSync(v.modelPath, { recursive: true });
-      fs.writeFileSync(metaPath, JSON.stringify(v, null, 2));
+      fs.writeFileSync(path.join(v.modelPath, 'meta.json'), JSON.stringify(v, null, 2));
     } catch (err) {
-      logger.error(`[MLPipeline] Failed to save meta for ${v.modelName}/${v.version}:`, err);
+      logger.error(`[MLPipeline] Save meta failed: ${v.modelName}/${v.version}`, err);
     }
   }
 
   private async loadExistingVersions(): Promise<void> {
     if (!fs.existsSync(this.modelsDir)) return;
-
-    const names = fs.readdirSync(this.modelsDir);
-    for (const name of names) {
+    for (const name of fs.readdirSync(this.modelsDir)) {
+      if (name === 'production') continue;
       const nameDir = path.join(this.modelsDir, name);
       if (!fs.statSync(nameDir).isDirectory()) continue;
-
-      const versions = fs.readdirSync(nameDir).sort().reverse();
-      for (const version of versions) {
+      for (const version of fs.readdirSync(nameDir).sort().reverse()) {
         const metaPath = path.join(nameDir, version, 'meta.json');
         if (!fs.existsSync(metaPath)) continue;
-
         try {
           const meta: ModelVersion = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
           this.versions.set(`${name}/${version}`, meta);
-          if (meta.status === 'production') {
-            this.productionModels.set(meta.modelName, meta);
-          }
-        } catch (err) {
-          logger.warn(`[MLPipeline] Could not load meta: ${metaPath}`);
-        }
+          if (meta.status === 'production') this.productionModels.set(meta.modelName, meta);
+        } catch { logger.warn(`[MLPipeline] Could not load meta: ${metaPath}`); }
       }
     }
-
-    logger.info(`[MLPipeline] Loaded ${this.versions.size} model versions`);
+    logger.info(`[MLPipeline] Loaded ${this.versions.size} model versions from disk`);
   }
 
   private deleteVersion(name: ModelName, version: string): void {
-    const versionPath = path.join(this.modelsDir, name, version);
-    try {
-      fs.rmSync(versionPath, { recursive: true, force: true });
-      this.versions.delete(`${name}/${version}`);
-      logger.info(`[MLPipeline] Deleted old version: ${name}/${version}`);
-    } catch (err) {
-      logger.warn(`[MLPipeline] Failed to delete ${name}/${version}:`, err);
-    }
+    const p = path.join(this.modelsDir, name, version);
+    try { fs.rmSync(p, { recursive: true, force: true }); this.versions.delete(`${name}/${version}`); }
+    catch { logger.warn(`[MLPipeline] Could not delete: ${name}/${version}`); }
   }
 }

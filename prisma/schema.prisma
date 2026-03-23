@@ -1,5 +1,7 @@
-// This is your Prisma schema file
-// Learn more: https://pris.ly/d/prisma-schema
+// schema.prisma  (v3.1 — P1 fix)
+// BRD v3 §8.3: Added paper_trades table with schema identical to trades
+// BRD v3 §3.2: Added ml_model_versions, ml_shadow_predictions tables
+// BRD v3 §6.1: Added circuit_breaker_events table
 
 generator client {
   provider = "prisma-client-js"
@@ -10,323 +12,322 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// ==========================================
-// CORE ENTITIES
-// ==========================================
+// ─── Core Trading ─────────────────────────────────────────────────────────────
 
 model Pool {
-  id          String   @id @default(uuid())
-  address     String   @unique
-  tokenA      String
-  tokenB      String
-  tokenASymbol String
-  tokenBSymbol String
-  
-  // Pool metrics
-  currentPrice Decimal  @db.Decimal(20, 10)
-  tvl          Decimal  @db.Decimal(20, 2)
-  volume24h    Decimal  @db.Decimal(20, 2)
-  feeRate      Decimal  @db.Decimal(8, 6)
-  volatility   Decimal  @db.Decimal(8, 6)
-  
-  // Timestamps
-  poolCreatedAt DateTime
+  id            String   @id @default(cuid())
+  address       String   @unique
+  tokenA        String
+  tokenB        String
+  currentTvl    Decimal  @db.Decimal(20, 2)
+  currentVolume Decimal  @db.Decimal(20, 2)
+  feeRate       Decimal  @db.Decimal(8, 6)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
-  
-  // Relations
-  positions     Position[]
-  snapshots     PoolSnapshot[]
-  aiDecisions   AIDecision[]
-  
-  @@index([address])
-  @@index([tvl])
-  @@index([volume24h])
-  @@index([updatedAt])
+
+  positions  Position[]
+  snapshots  PoolSnapshot[]
+  decisions  AiDecision[]
+
+  @@map("pools")
 }
 
 model Position {
-  id          String   @id @default(uuid())
-  
-  // Relations
-  pool        Pool     @relation(fields: [poolId], references: [id])
-  poolId      String
-  
-  // Strategy
-  strategy    String   // alpha, range, momentum
-  
-  // Entry details
-  entryPrice  Decimal  @db.Decimal(20, 10)
-  entryTime   DateTime
-  
-  // Investment
-  investmentSol  Decimal @db.Decimal(20, 10)
-  investmentUsd  Decimal @db.Decimal(20, 2)
-  
-  // Range
-  rangeLower  Decimal  @db.Decimal(20, 10)
-  rangeUpper  Decimal  @db.Decimal(20, 10)
-  
-  // Current state
-  currentPrice   Decimal?  @db.Decimal(20, 10)
-  currentValueUsd Decimal? @db.Decimal(20, 2)
-  
-  // Performance
-  realizedPnl    Decimal @db.Decimal(20, 2) @default(0)
-  unrealizedPnl  Decimal @db.Decimal(20, 2) @default(0)
-  pnlPercentage  Decimal @db.Decimal(8, 4) @default(0)
-  
-  // Fees
-  feesTokenA     Decimal @db.Decimal(20, 10) @default(0)
-  feesTokenB     Decimal @db.Decimal(20, 10) @default(0)
-  feesUsd        Decimal @db.Decimal(20, 2) @default(0)
-  
-  // Impermanent loss
-  impermanentLoss Decimal @db.Decimal(8, 4) @default(0)
-  
-  // Status
-  status      String   @default("active") // active, rebalancing, closing, closed
-  inRange     Boolean  @default(true)
-  
-  // AI metadata
-  aiConfidence Decimal @db.Decimal(5, 4)
-  riskScore    Int
-  expectedApr  Decimal @db.Decimal(8, 4)
-  
-  // Timestamps
-  lastRebalance DateTime?
-  exitTime      DateTime?
-  
-  // Transactions
-  entryTxSignature  String   @db.VarChar(88)
-  exitTxSignature   String?  @db.VarChar(88)
-  
-  // Metadata
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  
-  // Relations
-  trades        Trade[]
-  
-  @@index([poolId])
+  id               String    @id @default(cuid())
+  poolId           String
+  pool             Pool      @relation(fields: [poolId], references: [id])
+  tokenA           String
+  tokenB           String
+  strategy         String    // Alpha | Range | Momentum
+  entryPrice       Decimal   @db.Decimal(20, 10)
+  currentPrice     Decimal?  @db.Decimal(20, 10)
+  rangeLower       Decimal   @db.Decimal(20, 10)
+  rangeUpper       Decimal   @db.Decimal(20, 10)
+  investmentSol    Decimal   @db.Decimal(20, 10)
+  investmentUsd    Decimal   @db.Decimal(20, 2)
+  currentValueUsd  Decimal?  @db.Decimal(20, 2)
+  pnlUsd           Decimal?  @db.Decimal(20, 2)
+  pnlPercentage    Decimal?  @db.Decimal(8, 4)
+  feesEarnedUsd    Decimal?  @db.Decimal(20, 2)
+  impermanentLoss  Decimal?  @db.Decimal(8, 4)
+  aiConfidence     Decimal?  @db.Decimal(5, 4)
+  riskScore        Int?
+  status           String    // active | closed | rebalancing
+  entryTime        DateTime
+  lastRebalance    DateTime?
+  exitTime         DateTime?
+  txSignature      String?   @db.VarChar(88)
+  walletAddress    String?   // BRD v3 §9 — which hot wallet
+  createdAt        DateTime  @default(now())
+
+  trades Trade[]
+
   @@index([status])
-  @@index([entryTime])
-  @@index([exitTime])
+  @@index([poolId])
+  @@map("positions")
 }
 
 model Trade {
-  id          String   @id @default(uuid())
-  
-  // Relations
-  position    Position @relation(fields: [positionId], references: [id])
-  positionId  String
-  
-  // Trade details
-  type        String   // entry, exit, rebalance
-  action      String   // swap, add_liquidity, remove_liquidity
-  
-  // Token amounts
+  id          String   @id @default(cuid())
+  positionId  String?
+  position    Position? @relation(fields: [positionId], references: [id])
+  type        String   // entry | exit | rebalance
+  action      String   // swap | add_liquidity | remove_liquidity
   tokenIn     String?
   tokenOut    String?
   amountIn    Decimal? @db.Decimal(20, 10)
   amountOut   Decimal? @db.Decimal(20, 10)
-  
-  // Metrics
-  slippage    Decimal  @db.Decimal(8, 4)
-  gasCostSol  Decimal  @db.Decimal(20, 10)
-  
-  // Transaction
+  slippage    Decimal? @db.Decimal(8, 4)
+  gasCostSol  Decimal? @db.Decimal(20, 10)
+  jitoTipSol  Decimal? @db.Decimal(20, 10)   // BRD v3 §4.3
   txSignature String   @db.VarChar(88)
   success     Boolean
   errorMessage String?
-  
-  // Metadata
   timestamp   DateTime
-  createdAt   DateTime @default(now())
-  
+
   @@index([positionId])
   @@index([timestamp])
-  @@index([success])
+  @@map("trades")
 }
 
-// ==========================================
-// ANALYTICS & HISTORY
-// ==========================================
+// ─── P1 FIX: paper_trades (BRD v3 §8.3) ─────────────────────────────────────
+// "All simulated trades are logged to the paper_trades table with identical
+//  schema to live trades."
+
+model PaperTrade {
+  id          String   @id @default(cuid())
+  // Identical schema to Trade — paper trading mode
+  positionId  String?        // references PaperPosition (virtual)
+  type        String         // entry | exit | rebalance
+  action      String         // swap | add_liquidity | remove_liquidity
+  tokenIn     String?
+  tokenOut    String?
+  amountIn    Decimal? @db.Decimal(20, 10)
+  amountOut   Decimal? @db.Decimal(20, 10)
+  slippage    Decimal? @db.Decimal(8, 4)
+  gasCostSol  Decimal? @db.Decimal(20, 10)  // simulated at p95 historical
+  jitoTipSol  Decimal? @db.Decimal(20, 10)
+  txSignature String   @db.VarChar(88)      // "PAPER_" prefix for simulated
+  success     Boolean
+  errorMessage String?
+  timestamp   DateTime
+  // Paper trading extras
+  simulatedPnlUsd  Decimal? @db.Decimal(20, 2)
+  simulatedFees    Decimal? @db.Decimal(20, 2)
+  simulatedIL      Decimal? @db.Decimal(8, 4)
+  paperSessionId   String   // groups trades by paper trading session (30-day min)
+
+  @@index([paperSessionId])
+  @@index([timestamp])
+  @@map("paper_trades")
+}
+
+model PaperPosition {
+  id              String   @id @default(cuid())
+  paperSessionId  String
+  poolAddress     String
+  tokenA          String
+  tokenB          String
+  strategy        String
+  entryPrice      Decimal  @db.Decimal(20, 10)
+  rangeLower      Decimal  @db.Decimal(20, 10)
+  rangeUpper      Decimal  @db.Decimal(20, 10)
+  investmentUsd   Decimal  @db.Decimal(20, 2)
+  currentValueUsd Decimal? @db.Decimal(20, 2)
+  pnlUsd          Decimal? @db.Decimal(20, 2)
+  pnlPercentage   Decimal? @db.Decimal(8, 4)
+  feesEarnedUsd   Decimal? @db.Decimal(20, 2)
+  impermanentLoss Decimal? @db.Decimal(8, 4)
+  aiConfidence    Decimal? @db.Decimal(5, 4)
+  status          String   // active | closed
+  entryTime       DateTime
+  exitTime        DateTime?
+  createdAt       DateTime @default(now())
+
+  @@index([paperSessionId])
+  @@index([status])
+  @@map("paper_positions")
+}
+
+model PaperSession {
+  id          String   @id @default(cuid())
+  startedAt   DateTime @default(now())
+  endedAt     DateTime?
+  status      String   // active | completed | failed
+  totalPnlUsd Decimal? @db.Decimal(20, 2)
+  winRate     Decimal? @db.Decimal(5, 4)
+  sharpeRatio Decimal? @db.Decimal(8, 4)
+  dailyRoiAvg Decimal? @db.Decimal(8, 4)
+  // BRD §8.3: Pass criteria: win rate > 60%, ROI > 0.2% daily
+  passedGate  Boolean  @default(false)
+  notes       String?
+
+  @@map("paper_sessions")
+}
+
+// ─── Pool Snapshots ───────────────────────────────────────────────────────────
 
 model PoolSnapshot {
-  id          String   @id @default(uuid())
-  
-  // Relations
-  pool        Pool     @relation(fields: [poolId], references: [id])
-  poolId      String
-  
-  // Metrics at snapshot time
-  price       Decimal  @db.Decimal(20, 10)
-  tvl         Decimal  @db.Decimal(20, 2)
-  volume24h   Decimal  @db.Decimal(20, 2)
-  volatility  Decimal  @db.Decimal(8, 6)
-  
-  // Calculated scores
+  id               String   @id @default(cuid())
+  poolId           String
+  pool             Pool     @relation(fields: [poolId], references: [id])
+  price            Decimal  @db.Decimal(20, 10)
+  tvl              Decimal  @db.Decimal(20, 2)
+  volume24h        Decimal  @db.Decimal(20, 2)
+  feeRate          Decimal  @db.Decimal(8, 6)
+  volatility       Decimal? @db.Decimal(8, 6)
+  volumeTvlRatio   Decimal? @db.Decimal(8, 6)
   opportunityScore Decimal? @db.Decimal(5, 4)
-  feeApr      Decimal? @db.Decimal(8, 4)
-  
-  // Timestamp
-  timestamp   DateTime
-  
-  createdAt   DateTime @default(now())
-  
-  @@index([poolId])
-  @@index([timestamp])
+  timestamp        DateTime
+
   @@index([poolId, timestamp])
+  @@map("pool_snapshots")
 }
 
-model AIDecision {
-  id          String   @id @default(uuid())
-  
-  // Relations
-  pool        Pool     @relation(fields: [poolId], references: [id])
+// ─── AI Decisions ─────────────────────────────────────────────────────────────
+
+model AiDecision {
+  id          String   @id @default(cuid())
   poolId      String
-  
-  // Decision
-  action      String   // enter, exit, rebalance, hold, skip
-  strategy    String?  // alpha, range, momentum
+  pool        Pool     @relation(fields: [poolId], references: [id])
+  action      String   // ENTER | EXIT | SKIP | REBALANCE
+  strategy    String?
   confidence  Decimal  @db.Decimal(5, 4)
-  expectedApr Decimal  @db.Decimal(8, 4)
-  riskScore   Int
-  reasoning   String   @db.Text
-  
-  // Recommended parameters
-  recommendedRangeLower Decimal? @db.Decimal(20, 10)
-  recommendedRangeUpper Decimal? @db.Decimal(20, 10)
-  positionSize Decimal? @db.Decimal(8, 4)
-  
-  // Execution
+  expectedApr Decimal? @db.Decimal(8, 4)
+  riskScore   Int?
+  reasoning   String?
   executed    Boolean  @default(false)
   resultPnl   Decimal? @db.Decimal(20, 2)
-  resultSuccess Boolean?
-  
-  // Timestamp
   timestamp   DateTime
-  createdAt   DateTime @default(now())
-  
+
   @@index([poolId])
   @@index([timestamp])
-  @@index([executed])
-  @@index([action, timestamp])
+  @@map("ai_decisions")
 }
+
+// ─── Performance ──────────────────────────────────────────────────────────────
 
 model Performance {
-  id          String   @id @default(uuid())
-  
-  // Date (unique per day)
-  date        DateTime @unique
-  
-  // Balance
-  startingBalance Decimal @db.Decimal(20, 2)
-  endingBalance   Decimal @db.Decimal(20, 2)
-  
-  // PnL
-  realizedPnl   Decimal @db.Decimal(20, 2)
-  unrealizedPnl Decimal @db.Decimal(20, 2)
-  
-  // Breakdown
-  feesEarned    Decimal @db.Decimal(20, 2)
-  impermanentLoss Decimal @db.Decimal(20, 2)
-  
-  // Trading stats
-  totalTrades   Int
-  winningTrades Int
-  losingTrades  Int
-  winRate       Decimal @db.Decimal(5, 4)
-  averageReturn Decimal @db.Decimal(8, 4)
-  
-  // Risk metrics
-  sharpeRatio   Decimal? @db.Decimal(8, 4)
-  maxDrawdown   Decimal? @db.Decimal(8, 4)
-  volatility    Decimal? @db.Decimal(8, 4)
-  
-  // AI stats
-  aiConfidenceAvg Decimal? @db.Decimal(5, 4)
-  
-  createdAt     DateTime @default(now())
-  
-  @@index([date])
+  id               String   @id @default(cuid())
+  date             DateTime @unique @db.Date
+  startingBalance  Decimal  @db.Decimal(20, 2)
+  endingBalance    Decimal  @db.Decimal(20, 2)
+  realizedPnl      Decimal? @db.Decimal(20, 2)
+  unrealizedPnl    Decimal? @db.Decimal(20, 2)
+  feesEarned       Decimal? @db.Decimal(20, 2)
+  impermanentLoss  Decimal? @db.Decimal(20, 2)
+  totalTrades      Int?
+  winningTrades    Int?
+  aiConfidenceAvg  Decimal? @db.Decimal(5, 4)
+  sharpeRatio      Decimal? @db.Decimal(8, 4)
+  sortinoRatio     Decimal? @db.Decimal(8, 4)
+  maxDrawdown      Decimal? @db.Decimal(8, 4)
+  // BRD v3 §2.1: track regime per day
+  marketRegime     String?  // Bull | Bear | Sideways
+
+  @@map("performance")
 }
 
-// ==========================================
-// SYSTEM & AUDIT
-// ==========================================
+// ─── P1 FIX: ML Model Versions (BRD v3 §3.2) ─────────────────────────────────
 
-model SystemState {
-  id          String   @id @default(uuid())
-  
-  key         String   @unique
-  value       String
-  
-  updatedAt   DateTime @updatedAt
-  
-  @@index([key])
+model MlModelVersion {
+  id          String   @id @default(cuid())
+  modelName   String   // volume_predictor | price_trend_classifier | volatility_forecaster | strategy_selector
+  version     String   // ISO timestamp
+  gitSha      String
+  status      String   // training | shadow | production | rollback | retired
+  trainedAt   DateTime
+  promotedAt  DateTime?
+  retiredAt   DateTime?
+  modelPath   String
+  // Metrics
+  accuracy    Decimal? @db.Decimal(5, 4)
+  precision   Decimal? @db.Decimal(5, 4)
+  rmse        Decimal? @db.Decimal(8, 6)
+  winRate     Decimal? @db.Decimal(5, 4)
+  valLoss     Decimal? @db.Decimal(10, 8)
+  createdAt   DateTime @default(now())
+
+  @@unique([modelName, version])
+  @@index([modelName, status])
+  @@map("ml_model_versions")
 }
+
+model MlShadowPrediction {
+  id              String   @id @default(cuid())
+  modelName       String
+  shadowVersion   String
+  timestamp       DateTime
+  inputJson       Json     // input features
+  prediction      String   // serialized prediction value
+  actual          String?  // filled when outcome known
+  correct         Boolean?
+  createdAt       DateTime @default(now())
+
+  @@index([modelName, shadowVersion])
+  @@index([timestamp])
+  @@map("ml_shadow_predictions")
+}
+
+// ─── Circuit Breaker Events (BRD v3 §6.1) ────────────────────────────────────
+
+model CircuitBreakerEvent {
+  id          String   @id @default(cuid())
+  breakerType String   // daily_loss | max_drawdown | gas_spike | tvl_crash | volatility_spike | api_failure | il_threshold
+  triggered   Boolean
+  value       Decimal  @db.Decimal(20, 8)  // the value that triggered it
+  threshold   Decimal  @db.Decimal(20, 8)
+  action      String?  // what was done (stop_entries | emergency_exit | pause | reduce_size)
+  resetAt     DateTime?
+  timestamp   DateTime @default(now())
+
+  @@index([breakerType, timestamp])
+  @@map("circuit_breaker_events")
+}
+
+// ─── RPC Health Log (BRD v3 §7.3) ────────────────────────────────────────────
+
+model RpcHealthLog {
+  id          String   @id @default(cuid())
+  endpoint    String   // helius | alchemy | mainnet
+  tier        String   // primary | secondary | tertiary
+  healthy     Boolean
+  slotLag     Int?     // slots behind expected
+  latencyMs   Int?
+  failover    Boolean  @default(false)
+  timestamp   DateTime @default(now())
+
+  @@index([endpoint, timestamp])
+  @@map("rpc_health_logs")
+}
+
+// ─── Alert Events (BRD v3 §11) ───────────────────────────────────────────────
+
+model AlertEvent {
+  id           String   @id @default(cuid())
+  priority     String   // P0 | P1 | P2 | P3
+  type         String   // loss_warning | circuit_breaker | il_alert | rpc_failover | etc
+  message      String
+  telegramSent Boolean  @default(false)
+  smsSent      Boolean  @default(false)  // BRD v3 §11: SMS for P0
+  acknowledged Boolean  @default(false)
+  acknowledgedAt DateTime?
+  timestamp    DateTime @default(now())
+
+  @@index([priority, timestamp])
+  @@map("alert_events")
+}
+
+// ─── Audit Log ────────────────────────────────────────────────────────────────
 
 model AuditLog {
-  id          String   @id @default(uuid())
-  
-  userId      String?
-  action      String
-  details     Json?
-  ipAddress   String?
-  
-  timestamp   DateTime
-  createdAt   DateTime @default(now())
-  
-  @@index([userId])
-  @@index([action])
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String
+  details   Json?
+  ipAddress String?
+  timestamp DateTime @default(now())
+
   @@index([timestamp])
-}
-
-model TelegramSession {
-  id          String   @id @default(uuid())
-  
-  userId      String   @unique
-  username    String?
-  isAuthorized Boolean @default(false)
-  isAdmin     Boolean @default(false)
-  
-  // 2FA
-  twoFASecret String?
-  twoFAVerified Boolean @default(false)
-  
-  // Session
-  lastActivity DateTime
-  createdAt   DateTime @default(now())
-  
-  @@index([userId])
-  @@index([isAuthorized])
-}
-
-// ==========================================
-// NOTIFICATIONS
-// ==========================================
-
-model Notification {
-  id          String   @id @default(uuid())
-  
-  type        String   // profit, loss, rebalance, entry, exit, emergency, daily_report
-  title       String
-  message     String   @db.Text
-  
-  // Data
-  data        Json?
-  
-  // Delivery
-  sent        Boolean  @default(false)
-  sentAt      DateTime?
-  error       String?
-  
-  // Metadata
-  createdAt   DateTime @default(now())
-  
-  @@index([type])
-  @@index([sent])
-  @@index([createdAt])
+  @@map("audit_log")
 }
