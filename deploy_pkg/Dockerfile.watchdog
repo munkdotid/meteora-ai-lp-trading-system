@@ -1,0 +1,25 @@
+# Dockerfile.watchdog
+# Minimal watchdog container — BRD v3 §11.2 Dead Man's Switch
+# Intentionally separate from main app so it survives app crashes
+
+FROM node:20-alpine
+
+WORKDIR /watchdog
+
+# Only install what watchdog needs
+COPY package.json tsconfig.json ./
+RUN npm install --production 2>/dev/null || npm install
+
+COPY src/workers/watchdog.ts ./src/workers/
+
+RUN npx tsc src/workers/watchdog.ts \
+    --outDir dist \
+    --target ES2020 \
+    --module commonjs \
+    --esModuleInterop true \
+    --strict false 2>/dev/null || true
+
+# Fallback: run with ts-node if compile fails
+RUN npm install -g ts-node 2>/dev/null || true
+
+CMD ["node", "-e", "try { require('./dist/src/workers/watchdog.js') } catch(e) { require('ts-node/register'); require('./src/workers/watchdog.ts') }"]

@@ -1,0 +1,146 @@
+# docker-compose.yml — Updated for BRD v3.0
+# NEW: watchdog service (Dead Man's Switch), updated env vars for multi-RPC + multi-wallet
+
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: meteora_app
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      # Multi-RPC (BRD v3 §7.3)
+      SOLANA_RPC_PRIMARY: ${SOLANA_RPC_PRIMARY}
+      SOLANA_RPC_SECONDARY: ${SOLANA_RPC_SECONDARY}
+      SOLANA_RPC_TERTIARY: ${SOLANA_RPC_TERTIARY:-https://api.mainnet-beta.solana.com}
+      SOLANA_RPC_HEALTH_CHECK_INTERVAL: ${SOLANA_RPC_HEALTH_CHECK_INTERVAL:-30000}
+      # Multi-wallet (BRD v3 §9)
+      WALLET_HOT_PRIMARY_KEY: ${WALLET_HOT_PRIMARY_KEY}
+      WALLET_HOT_SECONDARY_KEY: ${WALLET_HOT_SECONDARY_KEY}
+      WALLET_WARM_KEY: ${WALLET_WARM_KEY}
+      WALLET_COLD_KEY: ${WALLET_COLD_KEY}
+      WALLET_REFILL_THRESHOLD_SOL: ${WALLET_REFILL_THRESHOLD_SOL:-0.5}
+      # Database
+      DATABASE_URL: postgresql://meteora:${POSTGRES_PASSWORD}@db:5432/meteora_bot
+      REDIS_URL: redis://redis:6379
+      # Telegram
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_AUTHORIZED_USERS: ${TELEGRAM_AUTHORIZED_USERS}
+      ADMIN_USERS: ${ADMIN_USERS}
+      DASHBOARD_URL: ${DASHBOARD_URL:-http://localhost:3001}
+      # Twilio SMS (BRD v3 §11)
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_PHONE_FROM: ${TWILIO_PHONE_FROM}
+      TWILIO_PHONE_TO: ${TWILIO_PHONE_TO}
+      # Disaster recovery (BRD v3 §7)
+      DEAD_MANS_SWITCH_TTL: ${DEAD_MANS_SWITCH_TTL:-90}
+      DR_BACKUP_S3_BUCKET: ${DR_BACKUP_S3_BUCKET}
+      DR_BACKUP_INTERVAL_HOURS: ${DR_BACKUP_INTERVAL_HOURS:-6}
+      # Backtesting (BRD v3 §8)
+      PAPER_TRADING_MODE: ${PAPER_TRADING_MODE:-false}
+      BACKTEST_MIN_DAYS: ${BACKTEST_MIN_DAYS:-90}
+      PAPER_TRADE_REPORT_HOUR: ${PAPER_TRADE_REPORT_HOUR:-8}
+      # Trading
+      MAX_POSITIONS: ${MAX_POSITIONS:-5}
+      MAX_PER_POOL: ${MAX_PER_POOL:-0.20}
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-180000}
+      RISK_LEVEL: ${RISK_LEVEL:-medium}
+      JWT_SECRET: ${JWT_SECRET}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./logs:/app/logs
+      - ./data/models:/app/data/models
+    networks:
+      - meteora_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── BRD v3 §11.2: Dead Man's Switch watchdog (separate container) ──────────
+  watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile.watchdog
+    container_name: meteora_watchdog
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_AUTHORIZED_USERS: ${TELEGRAM_AUTHORIZED_USERS}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_PHONE_FROM: ${TWILIO_PHONE_FROM}
+      TWILIO_PHONE_TO: ${TWILIO_PHONE_TO}
+      DEAD_MANS_SWITCH_TTL: ${DEAD_MANS_SWITCH_TTL:-90}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - meteora_net
+
+  db:
+    image: postgres:15-alpine
+    container_name: meteora_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: meteora
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: meteora_bot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - meteora_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meteora -d meteora_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: meteora_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - meteora_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    image: nginx:alpine
+    container_name: meteora_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - app
+    networks:
+      - meteora_net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  meteora_net:
+    driver: bridge
